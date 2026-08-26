@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.PhoneWebcam" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#2ECC71</item>
+        <item name="colorPrimaryDark">#27AE60</item>
+        <item name="colorAccent">#2ECC71</item>
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>
