@@ -7,6 +7,9 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Bundle
 import android.util.Log
 import android.util.Size
@@ -58,13 +61,22 @@ class MainActivity : AppCompatActivity() {
     private var discoverySocket: DatagramSocket? = null
     private val discoveryRunning = AtomicBoolean(false)
 
+    private var audioThread: Thread? = null
+    private val audioRunning = AtomicBoolean(false)
+
     private val prefs by lazy { getSharedPreferences("phone_webcam", MODE_PRIVATE) }
 
     companion object {
         private const val WS_PORT = 8765
         private const val DISCOVERY_PORT = 47777
-        private const val REQUEST_CAMERA_PERMISSION = 10
+        private const val REQUEST_PERMISSIONS_CODE = 10
         private const val TAG = "PhoneWebcam"
+
+        // 1-byte message type prefix, so video and audio can share one WebSocket connection.
+        private const val MSG_TYPE_VIDEO: Byte = 0x01
+        private const val MSG_TYPE_AUDIO: Byte = 0x02
+
+        private const val AUDIO_SAMPLE_RATE = 44100
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -86,11 +98,16 @@ class MainActivity : AppCompatActivity() {
             .pingInterval(15, TimeUnit.SECONDS)
             .build()
 
-        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
+        val neededPermissions = arrayOf(
+            android.Manifest.permission.CAMERA,
+            android.Manifest.permission.RECORD_AUDIO
+        ).filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (neededPermissions.isNotEmpty()) {
             ActivityCompat.requestPermissions(
-                this, arrayOf(android.Manifest.permission.CAMERA), REQUEST_CAMERA_PERMISSION
+                this, neededPermissions.toTypedArray(), REQUEST_PERMISSIONS_CODE
             )
         } else {
             startCamera()
@@ -113,11 +130,21 @@ class MainActivity : AppCompatActivity() {
         requestCode: Int, permissions: Array<out String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_CAMERA_PERMISSION) {
-            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+        if (requestCode == REQUEST_PERMISSIONS_CODE) {
+            val cameraIndex = permissions.indexOf(android.Manifest.permission.CAMERA)
+            val cameraGranted = cameraIndex == -1 ||
+                (grantResults.getOrNull(cameraIndex) == PackageManager.PERMISSION_GRANTED)
+            if (cameraGranted) {
                 startCamera()
             } else {
                 Toast.makeText(this, "카메라 권한이 필요합니다", Toast.LENGTH_LONG).show()
+            }
+
+            val audioIndex = permissions.indexOf(android.Manifest.permission.RECORD_AUDIO)
+            val audioGranted = audioIndex == -1 ||
+                (grantResults.getOrNull(audioIndex) == PackageManager.PERMISSION_GRANTED)
+            if (!audioGranted) {
+                Toast.makeText(this, "마이크 권한이 없어 오디오는 전송되지 않습니다", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -162,7 +189,10 @@ class MainActivity : AppCompatActivity() {
         }
         try {
             val jpegBytes = imageProxyToJpeg(imageProxy, quality = 65)
-            webSocket?.send(jpegBytes.toByteString(0, jpegBytes.size))
+            val packet = ByteArray(jpegBytes.size + 1)
+            packet[0] = MSG_TYPE_VIDEO
+            System.arraycopy(jpegBytes, 0, packet, 1, jpegBytes.size)
+            webSocket?.send(packet.toByteString(0, packet.size))
         } catch (e: Exception) {
             Log.e(TAG, "프레임 변환 실패", e)
         } finally {
@@ -240,6 +270,66 @@ class MainActivity : AppCompatActivity() {
         return out.toByteArray()
     }
 
+    // ---------- Audio (microphone) ----------
+
+    private fun startAudioStreaming() {
+        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(TAG, "마이크 권한이 없어 오디오 스트리밍을 시작하지 않습니다")
+            return
+        }
+        if (audioRunning.getAndSet(true)) return
+
+        audioThread = Thread {
+            var recorder: AudioRecord? = null
+            try {
+                val channelConfig = AudioFormat.CHANNEL_IN_MONO
+                val encoding = AudioFormat.ENCODING_PCM_16BIT
+                val minBufSize = AudioRecord.getMinBufferSize(AUDIO_SAMPLE_RATE, channelConfig, encoding)
+                if (minBufSize <= 0) {
+                    Log.e(TAG, "AudioRecord 버퍼 크기 계산 실패")
+                    return@Thread
+                }
+
+                recorder = AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    AUDIO_SAMPLE_RATE, channelConfig, encoding, minBufSize * 2
+                )
+                if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+                    Log.e(TAG, "AudioRecord 초기화 실패")
+                    return@Thread
+                }
+
+                recorder.startRecording()
+                val chunk = ByteArray(2048)
+                while (audioRunning.get()) {
+                    val read = recorder.read(chunk, 0, chunk.size)
+                    if (read > 0 && isConnected.get()) {
+                        val packet = ByteArray(read + 1)
+                        packet[0] = MSG_TYPE_AUDIO
+                        System.arraycopy(chunk, 0, packet, 1, read)
+                        webSocket?.send(packet.toByteString(0, packet.size))
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "오디오 캡처 실패", e)
+            } finally {
+                try {
+                    recorder?.stop()
+                } catch (_: Exception) {
+                }
+                recorder?.release()
+            }
+        }
+        audioThread?.start()
+    }
+
+    private fun stopAudioStreaming() {
+        audioRunning.set(false)
+        audioThread = null
+    }
+
     // ---------- Networking ----------
 
     private fun connect() {
@@ -255,6 +345,7 @@ class MainActivity : AppCompatActivity() {
         webSocket = httpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 isConnected.set(true)
+                startAudioStreaming()
                 runOnUiThread {
                     statusText.text = "✅ 연결됨: $ip"
                     connectButton.text = "연결 끊기"
@@ -263,6 +354,7 @@ class MainActivity : AppCompatActivity() {
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 isConnected.set(false)
+                stopAudioStreaming()
                 runOnUiThread {
                     statusText.text = "❌ 연결 실패: ${t.message}"
                     connectButton.text = "연결"
@@ -271,6 +363,7 @@ class MainActivity : AppCompatActivity() {
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 isConnected.set(false)
+                stopAudioStreaming()
                 runOnUiThread {
                     statusText.text = "연결 끊김"
                     connectButton.text = "연결"
@@ -283,6 +376,7 @@ class MainActivity : AppCompatActivity() {
         webSocket?.close(1000, "user disconnect")
         webSocket = null
         isConnected.set(false)
+        stopAudioStreaming()
         statusText.text = "연결 안됨"
         connectButton.text = "연결"
     }
@@ -327,6 +421,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         discoveryRunning.set(false)
         discoverySocket?.close()
+        stopAudioStreaming()
         cameraExecutor.shutdown()
         webSocket?.close(1000, "activity destroyed")
     }
